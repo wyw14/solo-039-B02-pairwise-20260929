@@ -18,6 +18,17 @@ func ValidateGrade(grade string) error {
 	return nil
 }
 
+func ValidateSource(source string) error {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return errors.New("feed source is required")
+	}
+	if len(source) > 64 {
+		return errors.New("feed source is too long")
+	}
+	return nil
+}
+
 func ValidatePlan(plan ProductPlan) error {
 	if plan.Campaign == uuid.Nil || plan.Revision == uuid.Nil {
 		return errors.New("plan identity is required")

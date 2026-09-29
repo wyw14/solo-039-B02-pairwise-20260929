@@ -1,8 +1,11 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"time"
+
+	"github.com/wyw14/solo-039/internal/service"
 )
 
 func (s *Server) transition(w http.ResponseWriter, r *http.Request) {
@@ -13,6 +16,24 @@ func (s *Server) transition(w http.ResponseWriter, r *http.Request) {
 	}
 	value, err := s.plant.Transition(r.Context(), input.Grade, input.Source)
 	if err != nil {
+		var failure *service.TransitionFailure
+		if errors.As(err, &failure) {
+			// Coherent verdict: batch and feed agree on a conclusion, and the
+			// response names the exact step the operator retries from.
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":        err.Error(),
+				"grade":        failure.Grade,
+				"source":       failure.Source,
+				"failed_stage": failure.FailedStage,
+				"rolled_back":  failure.RolledBack,
+				"safe_stop":    failure.SafeStop,
+				"landed_phase": failure.LandedPhase,
+				"campaign":     value,
+				"retry_step":   failure.RetryStep,
+				"retry_hint":   failure.RetryHint,
+			})
+			return
+		}
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}

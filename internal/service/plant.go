@@ -144,19 +144,39 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 }
 
 func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Campaign, error) {
+	// Validate the request before publishing any batch change. A rejected request
+	// must leave the running batch and its feed exactly as they were.
 	if err := model.ValidateGrade(grade); err != nil {
-		return model.Campaign{}, err
+		return model.Campaign{}, p.rejectTransition(grade, source, err)
+	}
+	if err := model.ValidateSource(source); err != nil {
+		return model.Campaign{}, p.rejectTransition(grade, source, err)
 	}
 	before := p.Campaign.Snapshot()
+	if !model.CanTransition(before.Phase, model.Transitioning) {
+		return before, p.rejectTransition(grade, source,
+			fmt.Errorf("campaign phase %q cannot transition grades", before.Phase))
+	}
+	// Capture the source the plant is feeding from so the failure path can tell
+	// whether the feed switch restored that exact source.
+	priorSource := ""
+	if p.Feed.Current != nil {
+		priorSource = p.Feed.Current.Source
+	}
+
+	// Publish the intended next batch revision, then switch the feed. The feed
+	// switch is atomic: it either activates the new source or leaves feed in a
+	// known state (previous source re-opened, or everything isolated).
 	current := p.Campaign.Advance(model.Transitioning)
 	current.Grade = grade
 	current.Revision = uuid.New()
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "grade transition")
+
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
-		p.fail(err)
-		return model.Campaign{}, err
+		return p.reconcileTransitionFailure(ctx, before, current, grade, source, priorSource, feedFailureStage(err), err)
 	}
+
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.FeedMetrics.Record(source)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
@@ -165,6 +185,116 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 		return model.Campaign{}, err
 	}
 	return p.Campaign.Snapshot(), nil
+}
+
+// rejectTransition builds a failure verdict for requests that never mutated
+// plant state; the operator simply corrects the input and re-issues.
+func (p *Plant) rejectTransition(grade, source string, cause error) *TransitionFailure {
+	step := RetryReissueTransition
+	hint := "correct the request and re-issue the grade transition from the start"
+	if model.ValidateSource(source) != nil {
+		step = RetryChooseSource
+		hint = "select an available, non-empty feed source and re-issue the grade transition"
+	}
+	p.fail(cause)
+	return &TransitionFailure{
+		Grade:       grade,
+		Source:      source,
+		FailedStage: "validate-transition-request",
+		RolledBack:  false,
+		SafeStop:    false,
+		LandedPhase: p.Campaign.Snapshot().Phase,
+		RetryStep:   step,
+		RetryHint:   hint,
+		cause:       cause,
+	}
+}
+
+// reconcileTransitionFailure makes the batch revision agree with whatever feed
+// state the switch actually left behind:
+//
+//   - If the previous feed is feeding again, the batch is rolled back to the
+//     previous grade/revision at a strictly newer epoch, so the original batch
+//     keeps producing and the operator re-issues the change.
+//   - If no feed is active, the plant is put in a feed-less safe stop. The new
+//     revision is retained but marked Stopped, heat is removed, and the operator
+//     must restore an available source before restarting.
+func (p *Plant) reconcileTransitionFailure(ctx context.Context, before, intended model.Campaign, grade, source, priorSource, stage string, cause error) (model.Campaign, error) {
+	failure := &TransitionFailure{Grade: grade, Source: source, FailedStage: stage, cause: cause}
+	currentRoute := p.Feed.Current
+	oldSourceActive := currentRoute != nil && currentRoute.Open && currentRoute.Flow > 0 &&
+		priorSource != "" && currentRoute.Source == priorSource
+
+	if oldSourceActive {
+		// Roll the batch back to its prior identity, but keep the epoch monotonic:
+		// durable feed.isolated events were already logged at the transition epoch,
+		// so an epoch regression would invalidate the journal sequence.
+		rolled := before
+		rolled.Epoch = intended.Epoch
+		campaign.Restore(p.Campaign, rolled)
+		p.Column.SetFeedRevision(currentRoute.Revision)
+		p.Column.Apply(rolled, p.Column.Snapshot().Pressure, p.Column.Snapshot().Level)
+		p.Analyzer.BindFeed(currentRoute.Revision)
+		p.CampaignHistory.Record(intended, rolled, "grade transition rolled back")
+
+		failure.RolledBack = true
+		failure.LandedPhase = rolled.Phase
+		failure.RetryStep = RetryReissueTransition
+		failure.RetryHint = fmt.Sprintf(
+			"previous batch %q on feed source %q is feeding again; re-issue the grade transition with an available source",
+			before.Grade, currentRoute.Source)
+
+		abortErr := p.record("campaign.transition.aborted",
+			fmt.Sprintf("rolled-back:%s:retry=%s", currentRoute.Source, failure.RetryStep))
+		p.fail(joinCause(cause, abortErr))
+		return p.Campaign.Snapshot(), failure
+	}
+
+	// No feed is active: hold the plant in a safe, feed-less stop tied to the new
+	// revision so the conclusion is unambiguous rather than a half-transition.
+	feedRevision := intended.Revision
+	if currentRoute != nil {
+		feedRevision = currentRoute.Revision
+		p.Column.SetFeedRevision(feedRevision)
+	}
+	// Remove heat deterministically: close and confirm the steam valve at the
+	// transition epoch, then cancel any in-flight ramp. Stop() alone only cancels
+	// the ramp and would leave residual steam on the reboiler.
+	steamErr := p.ReboilerCommands.Close(ctx, p.Reboiler, intended)
+	p.Reboiler.Stop()
+	p.RefluxState.Stop()
+	p.Campaign.Stop()
+	stopped := p.Campaign.Snapshot()
+	p.Column.Apply(stopped, p.Column.Snapshot().Pressure, p.Column.Snapshot().Level)
+	p.Analyzer.BindFeed(feedRevision)
+	p.CampaignHistory.Record(intended, stopped, "grade transition safe stop")
+	p.mu.Lock()
+	p.started = false
+	p.mu.Unlock()
+
+	failure.SafeStop = true
+	failure.LandedPhase = model.Stopped
+	failure.RetryStep = RetryResumeFeed
+	failure.RetryHint = "feed is isolated and heat is removed; re-establish an available feed source, then restart the campaign before attempting the grade change again"
+
+	abortErr := p.record("campaign.transition.safe_stop",
+		fmt.Sprintf("feed-isolated:%s:retry=%s", source, failure.RetryStep))
+	p.fail(joinCause(joinCause(cause, steamErr), abortErr))
+	return p.Campaign.Snapshot(), failure
+}
+
+func feedFailureStage(err error) string {
+	if sw, ok := asSwitchError(err); ok {
+		return sw.Stage
+	}
+	return "switch-feed-source"
+}
+
+func joinCause(primary, secondary error) error {
+	if secondary == nil {
+		return primary
+	}
+	return errors.Join(primary, secondary)
 }
 
 func (p *Plant) AddSample(value float64, at int64) (int, error) {
