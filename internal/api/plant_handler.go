@@ -2,8 +2,25 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"time"
 )
+
+func (s *Server) registerSource(w http.ResponseWriter, r *http.Request) {
+	var input sourceRequest
+	if err := decodeJSON(r, &input); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	source := strings.TrimSpace(input.Source)
+	if source == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "source is required"})
+		return
+	}
+	available := input.Available == nil || *input.Available
+	s.plant.SetSourceAvailable(source, available)
+	writeJSON(w, http.StatusAccepted, map[string]any{"source": source, "available": available})
+}
 
 func (s *Server) transition(w http.ResponseWriter, r *http.Request) {
 	var input transitionRequest
@@ -13,7 +30,7 @@ func (s *Server) transition(w http.ResponseWriter, r *http.Request) {
 	}
 	value, err := s.plant.Transition(r.Context(), input.Grade, input.Source)
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		writeTransitionError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, value)

@@ -22,6 +22,10 @@ type leaseRequest struct {
 	Owner  string  `json:"owner"`
 	Amount float64 `json:"amount"`
 }
+type sourceRequest struct {
+	Source    string `json:"source"`
+	Available *bool  `json:"available"`
+}
 
 func decodeJSON(r *http.Request, value any) error {
 	decoder := json.NewDecoder(r.Body)

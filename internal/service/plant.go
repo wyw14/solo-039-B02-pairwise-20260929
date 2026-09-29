@@ -52,6 +52,7 @@ type Plant struct {
 	Evidence          *analyzer.EvidenceCatalog
 	ReliefHistory     *relief.History
 	Incidents         *Incidents
+	Sources           map[string]bool
 	started           bool
 	lastError         string
 }
@@ -90,10 +91,24 @@ func NewPlant(dataDir string) *Plant {
 		Evidence:          analyzer.NewEvidenceCatalog(),
 		ReliefHistory:     relief.NewHistory(),
 		Incidents:         NewIncidents(),
+		Sources:           map[string]bool{"primary": true},
 	}
 	plant.Reflux.Register("T-101", plant.RefluxState)
 	plant.Feed.Observe = plant.observeFeed
+	plant.Feed.Available = func(source string) bool { return plant.Sources[source] }
 	return plant
+}
+
+// SetSourceAvailable 登记/撤销一个进料来源的可用性。
+// 撤销一个已投用来源前应先完成换品级；不可用来源会被换品级预检拒绝。
+func (p *Plant) SetSourceAvailable(source string, available bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if available {
+		p.Sources[source] = true
+	} else {
+		delete(p.Sources, source)
+	}
 }
 
 func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign, error) {
@@ -112,16 +127,21 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	p.started = true
 	p.lastError = ""
 	p.mu.Unlock()
-	current := p.Campaign.Snapshot()
-	before := current
+	before := p.Campaign.Snapshot()
+	// 先切进料（含可用性预检与失败回滚），成功后再提交开车批次的品级，
+	// 避免进料未建立却已改换批次品级。
+	if err := p.Feed.Switch(ctx, source, before); err != nil {
+		operationErr = err
+		p.fail(err)
+		p.mu.Lock()
+		p.started = false
+		p.mu.Unlock()
+		return model.Campaign{}, p.snapshotFailure(StageFeedSwitch, true, false, retryStartFeed, err)
+	}
+	current := before
 	current.Grade = grade
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "start grade selected")
-	if err := p.Feed.Switch(ctx, source, current); err != nil {
-		operationErr = err
-		p.fail(err)
-		return model.Campaign{}, err
-	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
 	p.Campaign.Advance(model.Warming)
@@ -145,24 +165,47 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 
 func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Campaign, error) {
 	if err := model.ValidateGrade(grade); err != nil {
-		return model.Campaign{}, err
+		return model.Campaign{}, p.snapshotFailure(StageValidate, true, false, retryValidate, err)
 	}
 	before := p.Campaign.Snapshot()
+	// 第一步：在提交任何批次修订之前先切进料。
+	// feed.Switch 自身具备原子性：新来源预检失败时不动旧来源；
+	// 关旧后新源激活失败时会重开旧源。因此进料要么完整切到新源，要么留在旧源。
+	if err := p.Feed.Switch(ctx, source, before); err != nil {
+		p.fail(err)
+		if p.Feed.Current.Active() {
+			// 旧来源已自动重开：批次修订尚未提交、进料留在原来源，结论一致。
+			return model.Campaign{}, p.snapshotFailure(StageFeedSwitch, true, false, retryFeedSwitch, err)
+		}
+		// 新旧来源都不可用：装置无进料，进入 transitioning 安全停留并切断蒸汽，
+		// 绝不在无进料的情况下继续按原批次生产。
+		hold := p.Campaign.Advance(model.Transitioning)
+		p.Column.Apply(hold, p.Column.Snapshot().Pressure, p.Column.Snapshot().Level)
+		if closeErr := p.ReboilerCommands.Close(ctx, p.Reboiler, hold); closeErr != nil {
+			// 指令通道也失败时至少就地停止再沸器控制环。
+			p.Reboiler.Stop()
+			err = errors.Join(err, closeErr)
+		}
+		p.ReboilerTelemetry.Record(p.Reboiler.Snapshot())
+		p.recordSafeHold(StageFeedSwitch)
+		return model.Campaign{}, p.snapshotFailure(StageFeedSwitch, false, true, retrySafeHold, err)
+	}
+
+	// 第二步：进料已切到新源，提交批次修订（新世代）。
 	current := p.Campaign.Advance(model.Transitioning)
 	current.Grade = grade
-	current.Revision = uuid.New()
+	current.Revision = p.Feed.Current.Revision
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "grade transition")
-	if err := p.Feed.Switch(ctx, source, current); err != nil {
-		p.fail(err)
-		return model.Campaign{}, err
-	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
-	p.FeedMetrics.Record(source)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
+
+	// 第三步：持久化。若持久化失败，进料与批次已在新世代一致，
+	// 但事件未落盘——不能静默回滚（否则内存与现场进料相反），进入安全停留。
 	if err := p.record("campaign.transition", grade); err != nil {
 		p.fail(err)
-		return model.Campaign{}, err
+		p.recordSafeHold(StageRecord)
+		return model.Campaign{}, p.snapshotFailure(StageRecord, false, true, retrySafeHold, err)
 	}
 	return p.Campaign.Snapshot(), nil
 }
@@ -300,10 +343,9 @@ func (p *Plant) record(kind, payload string) error {
 }
 
 func (p *Plant) observeFeed(value feed.Transition) {
-	payload := fmt.Sprintf("%s:%s:%t:%.2f:%s:%t", value.Stage, value.OldSource, value.OldOpen, value.OldFlow, value.NewSource, value.NewOpen)
-	if err := p.record("feed.transition", payload); err != nil {
-		p.fail(err)
-	}
+	// 切换过程中的事件不落盘：进料切换是批次修订的一部分，
+	// 持久化由批次提交（campaign.transition/plant.started）统一完成，
+	// 避免在批次修订尚未提交时写入指向新进料世代的中间事件。
 	if value.Stage == "new-active" {
 		p.FeedMetrics.Record(value.NewSource)
 	}
@@ -314,4 +356,12 @@ func (p *Plant) fail(err error) {
 	p.lastError = err.Error()
 	p.mu.Unlock()
 	p.Incidents.Open("runtime", err.Error(), p.Campaign.Snapshot().Revision.String())
+}
+
+// recordSafeHold 在进入安全停留时 best-effort 落盘一条中止事件并刷新快照，
+// 保证重启恢复到的批次/进料状态与现场一致；落盘失败只登记事故，不掩盖原始结论。
+func (p *Plant) recordSafeHold(stage string) {
+	if err := p.record("campaign.transition.aborted", stage); err != nil {
+		p.fail(err)
+	}
 }
